@@ -1,0 +1,12 @@
+# ===== Core =====
+torch>=2.1
+lightning>=2.2
+
+# ===== Data =====
+datasets>=2.18
+transformers>=4.38
+tokenizers>=0.15
+
+# ===== Utils =====
+numpy>=1.24
+tqdm>=4.66
