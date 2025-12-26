@@ -8,11 +8,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, IterableDataset
 
 import lightning as L
 import math
 
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+from lightning.pytorch.callbacks import ModelCheckpoint
 class PositionEncoding(nn.Module):
     def __init__(self, d_model=256, max_len=512):
         super().__init__()
@@ -131,6 +135,7 @@ class GPT1Mini(L.LightningModule):
         x = self.pos_emb(x)
 
         mask = self.causal_mask[:T, :T]
+        mask = ~mask
         mask = mask.unsqueeze(0).unsqueeze(0)
 
         for block in self.blocks:
@@ -158,8 +163,94 @@ class GPT1Mini(L.LightningModule):
             betas=(0.9, 0.95),
             weight_decay=0.1
         )
+class VietVaultGPTDataset(IterableDataset):
+    def __init__(self, hf_dataset, tokenizer, block_size=128, max_tokens=2_000_000):
+        self.dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.block_size = block_size
+        self.max_tokens = max_tokens
 
+    def __iter__(self):
+        token_count = 0
 
+        for sample in self.dataset:
+            text = sample["markdown"].strip()
+            if len(text) < 50:
+                continue
 
+            ids = self.tokenizer.encode(text)
 
+            for i in range(0, len(ids) - self.block_size, self.block_size):
+                x = ids[i:i+self.block_size]
+                y = ids[i+1:i+self.block_size+1]
 
+                yield torch.tensor(x), torch.tensor(y)
+
+                token_count += self.block_size
+                if token_count >= self.max_tokens:
+                    return
+def generate(model, tokenizer, prompt, max_new_tokens=80):
+    model.eval()
+    ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+
+    for _ in range(max_new_tokens):
+        with torch.no_grad():
+            logits = model(ids)
+        next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        ids = torch.cat([ids, next_id], dim=1)
+        ids = ids[:, -model.hparams.max_len:]
+
+    return tokenizer.decode(ids[0])
+if __name__ == "__main__":
+    dataset = load_dataset(
+        "nampdn-ai/vietvault",
+        split="train",
+        streaming=True
+    )
+
+    # for i, sample in enumerate(dataset):
+    #     print(sample["markdown"])
+    #     if i == 3:
+    #         break
+    tokenizer = AutoTokenizer.from_pretrained("NlpHUST/gpt2-vietnamese")
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    train_dataset = VietVaultGPTDataset(
+        dataset,
+        tokenizer,
+        block_size=128,
+        max_tokens=2_000_000  # TRAIN NHẸ LẦN ĐẦU
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=32,
+    )
+    model = GPT1Mini(
+        vocab_size=tokenizer.vocab_size,
+        d_model=256,
+        n_heads=8,
+        n_layers=6,
+        max_len=256,
+        lr=3e-4
+    )
+    
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="checkpoints",          # thư mục lưu
+        filename="gpt1mini-epoch{epoch}",# tên file
+        save_top_k=-1,                  # LƯU TẤT CẢ epoch
+        every_n_epochs=1,               # mỗi epoch lưu 1 lần
+        save_weights_only=True          # chỉ lưu weight (nhẹ)
+    )
+    
+    trainer = L.Trainer(
+        accelerator="gpu",
+        devices=1,
+        max_epochs=30,
+        precision="16-mixed",
+        callbacks=[checkpoint_callback],
+        log_every_n_steps=50,
+        gradient_clip_val=1.0
+    )
+
+    trainer.fit(model, train_loader)
